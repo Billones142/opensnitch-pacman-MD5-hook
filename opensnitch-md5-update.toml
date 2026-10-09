@@ -1,0 +1,42 @@
+# /etc/opensnitch-md5-update.toml
+# Configuration for the OpenSnitch MD5 pacman hook (opensnitch-md5-update.py).
+#
+# Every setting below is commented out, so by default no package is exempt and
+# every outdated MD5 is updated automatically after a pacman transaction.
+# Uncomment and edit the examples you need. `make install` never overwrites
+# this file once it exists.
+#
+# Binaries from exempt packages never get their MD5 updated automatically.
+# When one of them changes, the hook warns that the rule's MD5 is outdated
+# instead, so the rule stops matching until you decide to trust the new binary:
+#
+#   sudo opensnitch-md5-pin.py /etc/opensnitchd/rules/<rule>.json
+#
+# The file is checked strictly: invalid TOML, a wrong type or an unknown key
+# (usually a typo) stops the hook without changing any rule.
+
+
+# --- exempt_packages ---------------------------------------------------------
+# Names of the packages that own the binary (see `pacman -Qo /usr/bin/<name>`).
+# Shell-style wildcards are allowed: * matches anything, ? one character,
+# [abc] one of the listed characters. Default: [] (no package exempt).
+#
+# A single package:
+# exempt_packages = ["firefox"]
+#
+# Several packages and patterns (use only one exempt_packages line):
+# exempt_packages = [
+#     "firefox",
+#     "chromium",
+#     "python-*",   # every python-... package
+#     "*-git",      # VCS packages, usually built from the AUR
+#     "*-bin",      # prebuilt upstream binaries, usually from the AUR
+# ]
+
+
+# --- exempt_foreign ----------------------------------------------------------
+# Exempt every foreign package: installed, but not found in any configured
+# repository (AUR or locally built, list them with `pacman -Qm`).
+# Default: false.
+#
+# exempt_foreign = true

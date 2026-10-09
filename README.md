@@ -13,7 +13,9 @@ rule silently stops applying, so you get prompted again or the connection is den
 ## What it does
 
 After every pacman install/upgrade transaction, the hook runs
-`opensnitch-md5-update.py --auto`, which:
+`opensnitch-md5-update.py --auto --stdin-targets`. It's a `Type = Path` hook
+with `NeedsTargets`, so pacman passes the list of files the transaction
+installed or upgraded on stdin. The script then:
 
 1. Reads every `*.json` rule in the OpenSnitch rules directory.
 2. Finds each `list` operator that contains both a `process.path` and a
@@ -30,12 +32,19 @@ After every pacman install/upgrade transaction, the hook runs
    }
    ```
 
-3. Hashes the binary on disk (ELF files only) and compares it with the stored MD5.
-4. For every mismatch: backs up the rule file, writes the new MD5 (also keeping
+3. Skips the rule unless its binary is one of the files pacman just changed.
+   Paths are resolved first, so a rule on `/usr/sbin/foo` matches the
+   `/usr/bin/foo` that pacman reports (on Arch, `/usr/sbin` is a symlink).
+4. Hashes the binary on disk (ELF files only) and compares it with the stored MD5.
+5. If the binary belongs to an [exempt package](#exemptions), it leaves the rule
+   alone and prints a warning that the MD5 is outdated instead.
+6. For every other mismatch: backs up the rule file, writes the new MD5 (also keeping
    the JSON-string copy of the list in the operator's `data` field in sync), and
    saves the file atomically, keeping its original mode and owner.
 
 If nothing changed, it prints nothing; the run is only recorded in the log file.
+Output is colored when run from a terminal (set `NO_COLOR` to disable it); pacman
+passes hook output through a pipe, so it stays plain there.
 opensnitchd watches the rules directory and reloads edited rules on its own
 (unless it was started with `-no-live-reload`).
 
@@ -46,13 +55,13 @@ opensnitchd watches the rules directory and reloads edited rules on its own
 ## Requirements
 
 - Arch Linux (or another pacman-based distro)
-- Python 3 (standard library only)
+- Python 3.11+ (standard library only, uses `tomllib`)
 - OpenSnitch with rules stored as JSON files
 
 ## Install / uninstall
 
 Root is needed because the files are installed outside your home directory
-(`/usr/local/bin` and `/etc/pacman.d/hooks`):
+(`/usr/local/bin`, `/etc/pacman.d/hooks` and `/etc`):
 
 ```sh
 sudo make install
@@ -64,16 +73,19 @@ This installs:
 | File | Destination |
 |------|-------------|
 | `opensnitch-md5-update.py` | `/usr/local/bin/opensnitch-md5-update.py` |
+| `opensnitch-md5-pin.py` | `/usr/local/bin/opensnitch-md5-pin.py` |
 | `opensnitch-md5-update.hook` | `/etc/pacman.d/hooks/opensnitch-md5-update.hook` |
+| `opensnitch-md5-update.toml` | `/etc/opensnitch-md5-update.toml` (only if it doesn't exist yet) |
 
 `PREFIX`, `BINDIR`, `HOOKDIR` and `DESTDIR` can be overridden
 (e.g. `sudo make install PREFIX=/usr`); the hook's `Exec` line is rewritten to
 match `BINDIR`.
 
-`make uninstall` leaves the log and the rule backups in place. Remove them by hand
-if you no longer need them:
+`make uninstall` leaves the config, the log and the rule backups in place. Remove
+them by hand if you no longer need them:
 
 ```sh
+sudo rm /etc/opensnitch-md5-update.toml
 sudo rm /var/log/opensnitch-md5-update.log
 sudo rm -r /var/backups/opensnitch-rules
 ```
@@ -87,17 +99,79 @@ files (they are `0600 root`):
 # Interactive: shows the mismatches and asks before applying
 sudo opensnitch-md5-update.py
 
-# Automatic: applies without asking (what the pacman hook uses)
+# Automatic: checks every pinned binary and applies without asking
 sudo opensnitch-md5-update.py --auto
+
+# Only check the given files, one per line (what the pacman hook uses).
+# Paths may be relative to / like pacman sends them. Requires --auto,
+# because stdin carries the path list and can't answer the prompt.
+printf 'usr/bin/curl\n' | sudo opensnitch-md5-update.py --auto --stdin-targets
 ```
 
+Without `--stdin-targets` the script does a full scan. That's useful right after
+enabling checksums, or to catch binaries changed outside pacman. Exemptions apply
+to manual runs too.
+
+### Pinning a rule
+
+`opensnitch-md5-pin.py` writes the current MD5 of a rule's binary into the rule.
+A rule on a single exact `process.path` gets a `process.hash.md5` condition
+(a plain path rule is turned into a list rule, like the OpenSnitch UI does), and
+an outdated MD5 is refreshed. Rules with regexp paths or non-ELF targets
+(scripts) are left alone. The file is backed up first, and the change is logged
+to the same log file as the hook. It's the way to accept an update of an exempt
+package.
+
+```sh
+sudo opensnitch-md5-pin.py --dry-run /etc/opensnitchd/rules/<rule>.json  # preview
+sudo opensnitch-md5-pin.py /etc/opensnitchd/rules/<rule>.json
+```
+
+Only pin a binary you trust. For a package, `pacman -Qkk <package>` checks its
+files against the package database first.
+
 ## Configuration
+
+### Exemptions
+
+`/etc/opensnitch-md5-update.toml` lists packages whose binaries must never get
+their MD5 updated automatically. `make install` copies a default file where every
+setting is a commented-out example (so nothing is exempt until you uncomment one)
+and never overwrites the file once it exists. Example settings:
+
+```toml
+# Package names, shell-style wildcards allowed
+exempt_packages = ["firefox", "python-*"]
+
+# Every foreign package: AUR or locally built (see `pacman -Qm`)
+exempt_foreign = true
+```
+
+The owning package is looked up with `pacman -Qqo`. When an exempt binary
+changes, the rule is left untouched, so OpenSnitch stops matching it, and the
+hook warns you:
+
+```
+WARNING: outdated MD5 not updated in rule allow-firefox.json
+  Binary: /usr/lib/firefox/firefox (package 'firefox' is in exempt_packages)
+    Stored MD5:  ...
+    Current MD5: ...
+  The rule won't match the new binary. If you trust it, re-pin with:
+    sudo opensnitch-md5-pin.py /etc/opensnitchd/rules/allow-firefox.json
+```
+
+The config fails closed: an invalid file (bad TOML, wrong types or unknown keys,
+which are usually typos) stops the run without changing any rule, and a binary
+whose package can't be looked up is treated as exempt.
+
+### Environment variables
 
 | Environment variable | Default | Purpose |
 |----------------------|---------|---------|
 | `OPENSNITCH_RULES_DIR` | `Rules.Path` from `/etc/opensnitchd/default-config.json`, else `/etc/opensnitchd/rules` | Rules directory to scan |
 | `OPENSNITCH_BACKUP_DIR` | `/var/backups/opensnitch-rules` | Where backups are stored |
 | `OPENSNITCH_MD5_LOG_FILE` | `/var/log/opensnitch-md5-update.log` | Log file |
+| `OPENSNITCH_MD5_CONFIG` | `/etc/opensnitch-md5-update.toml` | Exemptions config |
 
 ## Backups and restoring
 
@@ -112,16 +186,22 @@ sudo cp -p /var/backups/opensnitch-rules/<rule>.json_<timestamp>.bak /etc/opensn
 
 ```sh
 make test   # unit tests (stdlib unittest, no root needed)
-make lint   # ruff check + ruff format --check
+make lint   # ruff check + ruff format --check on the project's Python files
 ```
+
+Tests never touch the real rules: they use temp dirs and mock the `pacman`
+queries. For a manual end-to-end run, point the scripts at temp files with the
+[environment variables](#environment-variables).
 
 ## Limitations
 
 - A rule is updated only if its MD5 entry sits in the same `list` operator as
   exactly one `process.path` entry; otherwise there's no way to know which binary
   the hash belongs to.
-- The hook triggers on every package (`Target = *`) and rescans all rules each time
-  instead of only the files touched by the transaction.
+- The hook only sees files changed by pacman (AUR packages count, since helpers
+  install them with `pacman -U`). Binaries updated some other way, such as
+  self-updating apps, manually extracted tarballs or `pip`, need a manual full run.
 - Updating the hash means trusting whatever the package manager installed. That's
   the point of the hook, but it also means a compromised package would get its
-  hash accepted automatically.
+  hash accepted automatically. Exempt packages you trust less (e.g. AUR ones) to
+  review their updates by hand.

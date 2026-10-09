@@ -2,16 +2,22 @@
 # /usr/local/bin/opensnitch-md5-update.py
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TextIO
+
+import tomllib
 
 # Configuration
 DAEMON_CONFIG = Path("/etc/opensnitchd/default-config.json")
@@ -20,6 +26,11 @@ BACKUP_DIR = Path(os.getenv("OPENSNITCH_BACKUP_DIR", "/var/backups/opensnitch-ru
 LOG_FILE = Path(
     os.getenv("OPENSNITCH_MD5_LOG_FILE", "/var/log/opensnitch-md5-update.log")
 )
+CONFIG_FILE = Path(
+    os.getenv("OPENSNITCH_MD5_CONFIG", "/etc/opensnitch-md5-update.toml")
+)
+CONFIG_KEYS = {"exempt_packages", "exempt_foreign"}
+PIN_COMMAND = "opensnitch-md5-pin.py"
 
 # OpenSnitch rule operator values (see opensnitch/config.py in the UI package)
 RULE_TYPE_LIST = "list"
@@ -30,7 +41,36 @@ OPERAND_PROCESS_HASH_MD5 = "process.hash.md5"
 # Pass as `extra=` to keep a record out of the console (log file only)
 FILE_ONLY = {"file_only": True}
 
+# ANSI escape codes, only used when writing to a terminal
+COLORS = {
+    "red": "31",
+    "green": "32",
+    "yellow": "33",
+    "cyan": "36",
+    "bold": "1",
+    "dim": "2",
+}
+LEVEL_COLORS = {logging.WARNING: "yellow", logging.ERROR: "red"}
+
 logger = logging.getLogger("opensnitch-md5-update")
+
+
+def use_color(stream: TextIO) -> bool:
+    """Color only interactive terminals, and honor https://no-color.org."""
+    return "NO_COLOR" not in os.environ and stream.isatty()
+
+
+def colorize(text: str, color: str, enabled: bool = True) -> str:
+    return f"\033[{COLORS[color]}m{text}\033[0m" if enabled else text
+
+
+class ColorFormatter(logging.Formatter):
+    """Color console messages by level."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        color = LEVEL_COLORS.get(min(record.levelno, logging.ERROR))
+        return colorize(message, color) if color else message
 
 
 class ConsoleFilter(logging.Filter):
@@ -45,7 +85,8 @@ def setup_logging(log_file: Path = LOG_FILE):
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
     console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(logging.Formatter("%(message)s"))
+    formatter_class = ColorFormatter if use_color(sys.stdout) else logging.Formatter
+    console.setFormatter(formatter_class("%(message)s"))
     console.addFilter(ConsoleFilter())
     logger.addHandler(console)
     logger.setLevel(logging.INFO)
@@ -107,6 +148,106 @@ def binary_path_of(operator: dict) -> str | None:
     return paths[0]["data"]
 
 
+def read_changed_paths(stream: TextIO) -> set[str]:
+    """Read pacman NeedsTargets paths (relative to /) as resolved absolute paths."""
+    paths = set()
+    for line in stream:
+        line = line.strip()
+        if line:
+            # Resolve symlinked dirs (e.g. /usr/sbin -> /usr/bin) so they match rules
+            paths.add(os.path.realpath("/" + line.lstrip("/")))
+    return paths
+
+
+def sync_list_data(operator: dict):
+    """Keep the JSON-string copy of the list in operator["data"] in sync."""
+    data = operator.get("data")
+    if not isinstance(data, str) or not data:
+        return
+    try:
+        if not isinstance(json.loads(data), list):
+            return
+    except json.JSONDecodeError:
+        return
+    operator["data"] = json.dumps(operator["list"])
+
+
+def run_pacman(*args: str) -> subprocess.CompletedProcess:
+    """Run a read-only pacman query. Raises OSError if pacman can't run."""
+    return subprocess.run(
+        ["pacman", *args], capture_output=True, text=True, check=False
+    )
+
+
+def package_owner(path: str) -> str | None:
+    """Name of the package owning path, None if no package owns it."""
+    result = run_pacman("-Qqo", path)
+    return (result.stdout.strip() or None) if result.returncode == 0 else None
+
+
+def foreign_packages() -> set[str]:
+    """Packages not found in the sync databases (AUR or locally built)."""
+    # -Qm exits 1 when there are none, which is not an error here
+    return set(run_pacman("-Qqm").stdout.split())
+
+
+class ConfigError(Exception):
+    """The hook configuration file is invalid."""
+
+
+@dataclass
+class Exemptions:
+    """Packages whose binaries must not get their MD5 updated automatically."""
+
+    packages: list[str] = field(default_factory=list)  # fnmatch patterns
+    foreign: bool = False
+    _foreign_cache: set[str] | None = field(default=None, init=False, repr=False)
+
+    def reason(self, binary_path: str) -> str | None:
+        """Why binary_path is exempt, or None if it may be updated."""
+        if not self.packages and not self.foreign:
+            return None
+        try:
+            package = package_owner(os.path.realpath(binary_path))
+            if package is None:
+                return None
+            if any(fnmatch.fnmatchcase(package, p) for p in self.packages):
+                return f"package '{package}' is in exempt_packages"
+            if self.foreign:
+                if self._foreign_cache is None:
+                    self._foreign_cache = foreign_packages()
+                if package in self._foreign_cache:
+                    return f"package '{package}' is a foreign (AUR) package"
+        except OSError as e:
+            # Fail closed: an exemption may apply but couldn't be checked
+            return f"package lookup failed: {e}"
+        return None
+
+
+def load_exemptions(config_file: Path = CONFIG_FILE) -> Exemptions:
+    """Read exemptions from the TOML config; a missing file means none."""
+    try:
+        with open(config_file, "rb") as f:
+            config = tomllib.load(f)
+    except FileNotFoundError:
+        return Exemptions()
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise ConfigError(f"Cannot read {config_file}: {e}") from e
+
+    # A typo would silently drop an exemption, so unknown keys are errors
+    unknown = set(config) - CONFIG_KEYS
+    if unknown:
+        raise ConfigError(f"{config_file}: unknown keys: {', '.join(sorted(unknown))}")
+
+    packages = config.get("exempt_packages", [])
+    foreign = config.get("exempt_foreign", False)
+    if not isinstance(packages, list) or not all(isinstance(p, str) for p in packages):
+        raise ConfigError(f"{config_file}: exempt_packages must be a list of strings")
+    if not isinstance(foreign, bool):
+        raise ConfigError(f"{config_file}: exempt_foreign must be true or false")
+    return Exemptions(packages, foreign)
+
+
 class MD5UpdateManager:
     """Manages OpenSnitch rule MD5 updates with backup and confirmation."""
 
@@ -115,13 +256,20 @@ class MD5UpdateManager:
         auto_apply: bool = False,
         rules_dir: Path | None = None,
         backup_dir: Path = BACKUP_DIR,
+        changed_paths: set[str] | None = None,
+        exemptions: Exemptions | None = None,
     ):
         self.auto_apply = auto_apply
+        self.exemptions = exemptions or Exemptions()
+        # None means "check every rule"; a set limits hashing to those files
+        self.changed_paths = changed_paths
         self.rules_dir = rules_dir or resolve_rules_dir()
         self.backup_dir = backup_dir
         self.changes_found = {}  # {rule_file: {binary_path: (old_md5, new_md5)}}
+        # {rule_file: {binary_path: (old_md5, new_md5, reason)}}
+        self.exempt_found = {}
 
-    def _ensure_backup_dir(self):
+    def ensure_backup_dir(self):
         """Create backup directory if it doesn't exist."""
         try:
             # Backups contain root-only rule files, keep the directory private
@@ -207,6 +355,10 @@ class MD5UpdateManager:
                 logger.debug("MD5 entry without a single process.path, skipping")
                 continue
 
+            if not self.was_changed(binary_path):
+                logger.debug(f"Not changed in this transaction: {binary_path}")
+                continue
+
             binary_file = Path(binary_path)
             if not binary_file.exists():
                 logger.debug(f"Binary not found: {binary_path}")
@@ -225,6 +377,12 @@ class MD5UpdateManager:
 
         return changes
 
+    def was_changed(self, binary_path: str) -> bool:
+        """Whether binary_path is among the changed files (always, if unfiltered)."""
+        if self.changed_paths is None:
+            return True
+        return os.path.realpath(binary_path) in self.changed_paths
+
     def update_md5_in_rule(
         self, rule_data: dict, binary_path: str, new_md5: str
     ) -> bool:
@@ -237,21 +395,9 @@ class MD5UpdateManager:
             for entry in find_entries(operator, OPERAND_PROCESS_HASH_MD5):
                 entry["data"] = new_md5
                 updated = True
-            self._sync_list_data(operator)
+            sync_list_data(operator)
 
         return updated
-
-    def _sync_list_data(self, operator: dict):
-        """Keep the JSON-string copy of the list in operator["data"] in sync."""
-        data = operator.get("data")
-        if not isinstance(data, str) or not data:
-            return
-        try:
-            if not isinstance(json.loads(data), list):
-                return
-        except json.JSONDecodeError:
-            return
-        operator["data"] = json.dumps(operator["list"])
 
     def scan_rules(self) -> bool:
         """Scan all rules and detect changes needed."""
@@ -264,12 +410,18 @@ class MD5UpdateManager:
             if rule_data is None:
                 continue
 
-            rule_changes = self.find_md5_changes(rule_data)
-            if rule_changes:
-                self.changes_found[rule_file] = rule_changes
+            for binary_path, md5s in self.find_md5_changes(rule_data).items():
+                reason = self.exemptions.reason(binary_path)
+                if reason is None:
+                    self.changes_found.setdefault(rule_file, {})[binary_path] = md5s
+                else:
+                    exempt = self.exempt_found.setdefault(rule_file, {})
+                    exempt[binary_path] = (*md5s, reason)
+
+        self.warn_exempt()
 
         if not self.changes_found:
-            logger.info("No MD5 mismatches detected.", extra=FILE_ONLY)
+            logger.info("No MD5 updates to apply.", extra=FILE_ONLY)
             return True
 
         logger.info("=" * 70)
@@ -283,6 +435,21 @@ class MD5UpdateManager:
                 logger.info(f"    New MD5: {new_md5}")
         logger.info("\n" + "=" * 70)
         return True
+
+    def warn_exempt(self):
+        """Warn about outdated MD5s left alone because of an exemption."""
+        for rule_file, entries in self.exempt_found.items():
+            logger.warning(
+                f"WARNING: outdated MD5 not updated in rule {rule_file.name}"
+            )
+            for binary_path, (old_md5, new_md5, reason) in entries.items():
+                logger.warning(f"  Binary: {binary_path} ({reason})")
+                logger.warning(f"    Stored MD5:  {old_md5}")
+                logger.warning(f"    Current MD5: {new_md5}")
+            logger.warning(
+                "  The rule won't match the new binary. If you trust it, re-pin with:"
+            )
+            logger.warning(f"    sudo {PIN_COMMAND} {rule_file}")
 
     def prompt_user(self) -> bool:
         """Prompt user to confirm MD5 updates."""
@@ -318,7 +485,7 @@ class MD5UpdateManager:
         if not self.changes_found:
             return 0
 
-        self._ensure_backup_dir()
+        self.ensure_backup_dir()
 
         logger.info("=" * 70)
         logger.info("APPLYING MD5 UPDATES")
@@ -361,6 +528,12 @@ class MD5UpdateManager:
     def run(self) -> int:
         """Run the full update workflow."""
         try:
+            if self.changed_paths is not None and not self.changed_paths:
+                logger.info(
+                    "No changed files received, nothing to do.", extra=FILE_ONLY
+                )
+                return 0
+
             if not self.scan_rules():
                 return 1
 
@@ -388,6 +561,9 @@ Examples:
   # Automatic mode (applies changes without prompting)
   %(prog)s --auto
 
+  # Only check binaries in a list of changed files (pacman NeedsTargets)
+  printf 'usr/bin/curl\n' | %(prog)s --auto --stdin-targets
+
   # Use custom rules directory
   OPENSNITCH_RULES_DIR=/custom/path %(prog)s --auto
         """,
@@ -399,13 +575,36 @@ Examples:
         help="Automatically apply changes without user confirmation",
     )
 
+    parser.add_argument(
+        "--stdin-targets",
+        action="store_true",
+        help="Only check binaries whose paths are read from stdin, one per line "
+        "(as passed by a pacman hook with NeedsTargets)",
+    )
+
     args = parser.parse_args()
+    if args.stdin_targets and not args.auto:
+        # stdin carries the path list, so the confirmation prompt can't read from it
+        parser.error("--stdin-targets requires --auto")
     setup_logging()
 
     mode = "AUTOMATIC" if args.auto else "INTERACTIVE"
     logger.info(f"OpenSnitch MD5 Update Hook Started (mode: {mode})", extra=FILE_ONLY)
 
-    manager = MD5UpdateManager(auto_apply=args.auto)
+    try:
+        exemptions = load_exemptions()
+    except ConfigError as e:
+        logger.error(f"{e}; no rules were changed")
+        return 1
+
+    changed_paths = None
+    if args.stdin_targets:
+        changed_paths = read_changed_paths(sys.stdin)
+        logger.info(f"Changed files received: {len(changed_paths)}", extra=FILE_ONLY)
+
+    manager = MD5UpdateManager(
+        auto_apply=args.auto, changed_paths=changed_paths, exemptions=exemptions
+    )
     return manager.run()
 
 

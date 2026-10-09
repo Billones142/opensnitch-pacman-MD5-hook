@@ -2,15 +2,19 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent.parent / "opensnitch-md5-update.py"
 spec = importlib.util.spec_from_file_location("md5_update", SCRIPT)
 md5_update = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(md5_update)
+
+SHIPPED_CONFIG = SCRIPT.parent / "opensnitch-md5-update.toml"
 
 ELF_CONTENT = b"\x7fELF fake binary"
 ELF_MD5 = hashlib.md5(ELF_CONTENT).hexdigest()
@@ -81,11 +85,22 @@ class MD5UpdateManagerTest(unittest.TestCase):
         path.write_text(rule if isinstance(rule, str) else json.dumps(rule))
         return path
 
-    def run_manager(self) -> int:
+    def run_manager(
+        self,
+        changed_paths: set[str] | None = None,
+        exemptions: "md5_update.Exemptions | None" = None,
+    ) -> int:
         manager = md5_update.MD5UpdateManager(
-            auto_apply=True, rules_dir=self.rules_dir, backup_dir=self.backup_dir
+            auto_apply=True,
+            rules_dir=self.rules_dir,
+            backup_dir=self.backup_dir,
+            changed_paths=changed_paths,
+            exemptions=exemptions,
         )
         return manager.run()
+
+    def rule_md5(self, rule_path: Path) -> str:
+        return json.loads(rule_path.read_text())["operator"]["list"][1]["data"]
 
     def test_outdated_md5_is_updated_with_data_copy(self):
         rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
@@ -153,6 +168,187 @@ class MD5UpdateManagerTest(unittest.TestCase):
         self.run_manager()
 
         self.assertEqual(rule_path.stat().st_mode & 0o777, 0o600)
+
+    def test_binary_in_changed_paths_is_updated(self):
+        rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
+
+        self.run_manager(changed_paths={os.path.realpath(self.binary)})
+
+        self.assertEqual(self.rule_md5(rule_path), ELF_MD5)
+
+    def test_binary_not_in_changed_paths_is_skipped(self):
+        rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
+
+        self.run_manager(changed_paths={"/usr/bin/something-else"})
+
+        self.assertEqual(self.rule_md5(rule_path), OLD_MD5)
+
+    def test_rule_path_through_symlinked_dir_matches(self):
+        # Like /usr/sbin -> /usr/bin: the rule uses the link, pacman the real path
+        link_dir = Path(self.tmp.name) / "sbin"
+        link_dir.symlink_to(self.binary.parent)
+        rule_path = self.write_rule(
+            "r.json", make_rule(str(link_dir / self.binary.name), OLD_MD5)
+        )
+
+        self.run_manager(changed_paths={os.path.realpath(self.binary)})
+
+        self.assertEqual(self.rule_md5(rule_path), ELF_MD5)
+
+    def test_empty_changed_paths_skips_scan(self):
+        rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
+
+        self.assertEqual(self.run_manager(changed_paths=set()), 0)
+
+        self.assertEqual(self.rule_md5(rule_path), OLD_MD5)
+        self.assertEqual(self.stdout.getvalue(), "")
+
+    def test_exempt_package_is_not_updated_and_warns(self):
+        rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
+        exemptions = md5_update.Exemptions(packages=["fire*"])
+
+        with mock.patch.object(md5_update, "package_owner", return_value="firefox"):
+            self.assertEqual(self.run_manager(exemptions=exemptions), 0)
+
+        self.assertEqual(self.rule_md5(rule_path), OLD_MD5)
+        output = self.stdout.getvalue()
+        self.assertIn("outdated MD5 not updated in rule r.json", output)
+        self.assertIn("'firefox' is in exempt_packages", output)
+        self.assertIn(f"opensnitch-md5-pin.py {rule_path}", output)
+
+    def test_non_exempt_package_is_updated(self):
+        rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
+        exemptions = md5_update.Exemptions(packages=["firefox"])
+
+        with mock.patch.object(md5_update, "package_owner", return_value="curl"):
+            self.run_manager(exemptions=exemptions)
+
+        self.assertEqual(self.rule_md5(rule_path), ELF_MD5)
+
+    def test_foreign_package_is_exempt(self):
+        rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
+
+        with (
+            mock.patch.object(md5_update, "package_owner", return_value="yay"),
+            mock.patch.object(md5_update, "foreign_packages", return_value={"yay"}),
+        ):
+            self.run_manager(exemptions=md5_update.Exemptions(foreign=True))
+
+        self.assertEqual(self.rule_md5(rule_path), OLD_MD5)
+        self.assertIn("foreign (AUR) package", self.stdout.getvalue())
+
+    def test_failed_package_lookup_is_treated_as_exempt(self):
+        rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
+        exemptions = md5_update.Exemptions(foreign=True)
+
+        with mock.patch.object(
+            md5_update, "package_owner", side_effect=OSError("no pacman")
+        ):
+            self.run_manager(exemptions=exemptions)
+
+        self.assertEqual(self.rule_md5(rule_path), OLD_MD5)
+        self.assertIn("package lookup failed", self.stdout.getvalue())
+
+    def test_no_exemptions_skips_package_lookup(self):
+        rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
+
+        with mock.patch.object(md5_update, "package_owner") as owner:
+            self.run_manager(exemptions=md5_update.Exemptions())
+
+        owner.assert_not_called()
+        self.assertEqual(self.rule_md5(rule_path), ELF_MD5)
+
+
+class LoadExemptionsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = Path(self.tmp.name) / "config.toml"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_file_means_no_exemptions(self):
+        self.assertEqual(
+            md5_update.load_exemptions(self.config), md5_update.Exemptions()
+        )
+
+    def test_valid_config(self):
+        self.config.write_text(
+            'exempt_packages = ["a", "b-*"]\nexempt_foreign = true\n'
+        )
+
+        exemptions = md5_update.load_exemptions(self.config)
+
+        self.assertEqual(exemptions.packages, ["a", "b-*"])
+        self.assertTrue(exemptions.foreign)
+
+    def test_shipped_config_has_no_exemptions(self):
+        self.assertEqual(
+            md5_update.load_exemptions(SHIPPED_CONFIG), md5_update.Exemptions()
+        )
+
+    def test_shipped_config_examples_are_valid(self):
+        lines = SHIPPED_CONFIG.read_text().splitlines()
+        # Uncomment the multi-line exempt_packages example and exempt_foreign
+        start = lines.index("# exempt_packages = [")
+        end = lines.index("# ]", start)
+        example = [line[2:] for line in lines[start : end + 1]]
+        example.append("exempt_foreign = true")
+        self.config.write_text("\n".join(example))
+
+        exemptions = md5_update.load_exemptions(self.config)
+
+        self.assertIn("python-*", exemptions.packages)
+        self.assertTrue(exemptions.foreign)
+        self.assertIn("# exempt_foreign = true", lines)
+
+    def test_invalid_configs_raise(self):
+        for content in (
+            "exempt_packages = [",
+            'exempt_packages = "firefox"',
+            "exempt_packages = [1]",
+            'exempt_foreign = "yes"',
+            "exempt_package = []",
+        ):
+            with self.subTest(content=content):
+                self.config.write_text(content)
+                with self.assertRaises(md5_update.ConfigError):
+                    md5_update.load_exemptions(self.config)
+
+
+class ColorTest(unittest.TestCase):
+    def test_colorize(self):
+        self.assertEqual(md5_update.colorize("x", "red"), "\033[31mx\033[0m")
+        self.assertEqual(md5_update.colorize("x", "red", enabled=False), "x")
+
+    def test_no_color_without_tty_or_with_no_color(self):
+        tty = mock.Mock(isatty=mock.Mock(return_value=True))
+        self.assertFalse(md5_update.use_color(io.StringIO()))
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            self.assertFalse(md5_update.use_color(tty))
+        with mock.patch.dict(os.environ, clear=True):
+            self.assertTrue(md5_update.use_color(tty))
+
+
+class ReadChangedPathsTest(unittest.TestCase):
+    def test_paths_are_made_absolute_and_blank_lines_ignored(self):
+        stream = io.StringIO("tmp\n\n  \n/tmp\n")
+
+        self.assertEqual(
+            md5_update.read_changed_paths(stream), {os.path.realpath("/tmp")}
+        )
+
+    def test_symlinked_dirs_are_resolved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "bin"
+            real.mkdir()
+            (real / "tool").touch()
+            (Path(tmp) / "sbin").symlink_to(real)
+            relative = str(Path(tmp) / "sbin" / "tool").lstrip("/")
+
+            paths = md5_update.read_changed_paths(io.StringIO(relative + "\n"))
+
+        self.assertEqual(paths, {os.path.realpath(real / "tool")})
 
 
 if __name__ == "__main__":
