@@ -1,0 +1,12 @@
+# /etc/pacman.d/hooks/opensnitch-md5-update.hook
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = *
+
+[Action]
+Description = Updating OpenSnitch rules with new binary MD5 hashes
+When = PostTransaction
+Exec = /usr/local/bin/opensnitch-md5-update.py --auto
+AbortOnFail = false
