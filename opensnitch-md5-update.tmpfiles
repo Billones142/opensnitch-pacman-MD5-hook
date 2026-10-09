@@ -1,0 +1,6 @@
+# /etc/tmpfiles.d/opensnitch-md5-update.conf
+# Remove the temporary "until reboot" rules that opensnitch-md5-update.py adds
+# for programs that were still running the old binary during an upgrade.
+# "!" limits this to boot, before opensnitchd starts and loads them again.
+# Edit the path if Rules.Path in /etc/opensnitchd/default-config.json differs.
+r! /etc/opensnitchd/rules/*-md5-transition-*.json

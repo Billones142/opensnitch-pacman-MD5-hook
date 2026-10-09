@@ -2,6 +2,7 @@
 # /usr/local/bin/opensnitch-md5-update.py
 
 import argparse
+import copy
 import fnmatch
 import hashlib
 import json
@@ -12,12 +13,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
-
-import tomllib
 
 # Configuration
 DAEMON_CONFIG = Path("/etc/opensnitchd/default-config.json")
@@ -29,8 +29,14 @@ LOG_FILE = Path(
 CONFIG_FILE = Path(
     os.getenv("OPENSNITCH_MD5_CONFIG", "/etc/opensnitch-md5-update.toml")
 )
-CONFIG_KEYS = {"exempt_packages", "exempt_foreign"}
+CONFIG_KEYS = {"exempt_packages", "exempt_foreign", "transition_rules"}
 PIN_COMMAND = "opensnitch-md5-pin.py"
+PROC_DIR = Path("/proc")
+
+# Transition rules keep the old MD5 for processes started before an upgrade.
+# The tmpfiles.d snippet deletes "*-md5-transition-*.json" at boot.
+TRANSITION_MARKER = "-md5-transition-"
+DURATION_UNTIL_RESTART = "until restart"
 
 # OpenSnitch rule operator values (see opensnitch/config.py in the UI package)
 RULE_TYPE_LIST = "list"
@@ -172,6 +178,52 @@ def sync_list_data(operator: dict):
     operator["data"] = json.dumps(operator["list"])
 
 
+def notify_rule_changed(rule_path: Path, content: bytes):
+    """Rewrite identical bytes in place so opensnitchd reloads the rule.
+
+    The daemon only reloads rules on fsnotify Write events, and the atomic
+    rename in save_rule_file only produces a Create event. Writing the same
+    bytes over the file never exposes a partial rule.
+    """
+    fd = os.open(rule_path, os.O_WRONLY)
+    try:
+        os.write(fd, content)
+    finally:
+        os.close(fd)
+
+
+def running_old_image(binary_path: str, proc_dir: Path = PROC_DIR) -> bool:
+    """Whether a process still runs the replaced (deleted) image of binary_path.
+
+    opensnitchd hashes /proc/<pid>/exe, so such a process keeps the old MD5
+    until it restarts.
+    """
+    target = os.path.realpath(binary_path) + " (deleted)"
+    for exe in proc_dir.glob("[0-9]*/exe"):
+        try:
+            if os.readlink(exe) == target:
+                return True
+        except OSError:
+            continue  # exited, kernel thread or not ours to read
+    return False
+
+
+def is_transition_rule(rule_file: Path) -> bool:
+    return TRANSITION_MARKER in rule_file.name
+
+
+def transition_rule(rule: dict, name: str) -> dict:
+    """Copy of a rule, still holding its old MD5s, that lasts until reboot."""
+    transition = copy.deepcopy(rule)
+    transition["name"] = name
+    transition["duration"] = DURATION_UNTIL_RESTART
+    transition["description"] = (
+        "Temporary: keeps the pre-upgrade binary of a running process allowed. "
+        "Added by opensnitch-md5-update, removed at boot."
+    )
+    return transition
+
+
 def run_pacman(*args: str) -> subprocess.CompletedProcess:
     """Run a read-only pacman query. Raises OSError if pacman can't run."""
     return subprocess.run(
@@ -224,17 +276,26 @@ class Exemptions:
         return None
 
 
-def load_exemptions(config_file: Path = CONFIG_FILE) -> Exemptions:
-    """Read exemptions from the TOML config; a missing file means none."""
+@dataclass
+class Config:
+    """Settings from the hook's TOML config file."""
+
+    exemptions: Exemptions = field(default_factory=Exemptions)
+    # Keep the old MD5 for programs still running the replaced binary
+    transition_rules: bool = True
+
+
+def load_config(config_file: Path = CONFIG_FILE) -> Config:
+    """Read the TOML config; a missing file means the defaults."""
     try:
         with open(config_file, "rb") as f:
             config = tomllib.load(f)
     except FileNotFoundError:
-        return Exemptions()
+        return Config()
     except (OSError, tomllib.TOMLDecodeError) as e:
         raise ConfigError(f"Cannot read {config_file}: {e}") from e
 
-    # A typo would silently drop an exemption, so unknown keys are errors
+    # A typo would silently drop a setting, so unknown keys are errors
     unknown = set(config) - CONFIG_KEYS
     if unknown:
         raise ConfigError(f"{config_file}: unknown keys: {', '.join(sorted(unknown))}")
@@ -243,9 +304,13 @@ def load_exemptions(config_file: Path = CONFIG_FILE) -> Exemptions:
     foreign = config.get("exempt_foreign", False)
     if not isinstance(packages, list) or not all(isinstance(p, str) for p in packages):
         raise ConfigError(f"{config_file}: exempt_packages must be a list of strings")
-    if not isinstance(foreign, bool):
-        raise ConfigError(f"{config_file}: exempt_foreign must be true or false")
-    return Exemptions(packages, foreign)
+    for key in ("exempt_foreign", "transition_rules"):
+        if key in config and not isinstance(config[key], bool):
+            raise ConfigError(f"{config_file}: {key} must be true or false")
+    return Config(
+        exemptions=Exemptions(packages, foreign),
+        transition_rules=config.get("transition_rules", True),
+    )
 
 
 class MD5UpdateManager:
@@ -258,9 +323,11 @@ class MD5UpdateManager:
         backup_dir: Path = BACKUP_DIR,
         changed_paths: set[str] | None = None,
         exemptions: Exemptions | None = None,
+        transition_rules: bool = True,
     ):
         self.auto_apply = auto_apply
         self.exemptions = exemptions or Exemptions()
+        self.transition_rules = transition_rules
         # None means "check every rule"; a set limits hashing to those files
         self.changed_paths = changed_paths
         self.rules_dir = rules_dir or resolve_rules_dir()
@@ -321,25 +388,35 @@ class MD5UpdateManager:
             return None
 
     def save_rule_file(self, rule_path: Path, data: dict) -> bool:
-        """Atomically save rule data, keeping the original mode and owner."""
+        """Atomically save rule data, keeping the mode and owner of an existing
+        file (new files get mkstemp's 0600)."""
+        content = (json.dumps(data, indent=2) + "\n").encode()
         tmp_path = None
         try:
-            st = rule_path.stat()
+            st = rule_path.stat() if rule_path.exists() else None
             fd, tmp_path = tempfile.mkstemp(dir=rule_path.parent, suffix=".tmp")
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f, indent=2)
-                f.write("\n")
-                os.fchmod(f.fileno(), st.st_mode & 0o7777)
-                if os.geteuid() == 0:
-                    os.fchown(f.fileno(), st.st_uid, st.st_gid)
+            with os.fdopen(fd, "wb") as f:
+                f.write(content)
+                if st is not None:
+                    os.fchmod(f.fileno(), st.st_mode & 0o7777)
+                    if os.geteuid() == 0:
+                        os.fchown(f.fileno(), st.st_uid, st.st_gid)
             os.replace(tmp_path, rule_path)
-            logger.debug(f"Rule file saved: {rule_path}")
-            return True
         except OSError as e:
             logger.error(f"Could not save rule file {rule_path}: {e}")
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             return False
+
+        try:
+            notify_rule_changed(rule_path, content)
+        except OSError as e:
+            logger.warning(
+                f"Saved {rule_path.name}, but opensnitchd may not reload it until "
+                f"it restarts: {e}"
+            )
+        logger.debug(f"Rule file saved: {rule_path}")
+        return True
 
     def find_md5_changes(self, rule_data: dict) -> dict[str, tuple]:
         """Return {binary_path: (old_md5, new_md5)} for outdated MD5 entries."""
@@ -406,6 +483,8 @@ class MD5UpdateManager:
             return False
 
         for rule_file in sorted(self.rules_dir.glob("*.json")):
+            if is_transition_rule(rule_file):
+                continue  # must keep its old MD5 until reboot
             rule_data = self.load_rule_file(rule_file)
             if rule_data is None:
                 continue
@@ -506,6 +585,8 @@ class MD5UpdateManager:
                 logger.error(f"Skipping {rule_file.name} due to load failure")
                 continue
 
+            original = copy.deepcopy(rule_data)
+
             # Apply updates
             for binary_path, (old_md5, new_md5) in changes.items():
                 if self.update_md5_in_rule(rule_data, binary_path, new_md5):
@@ -513,6 +594,10 @@ class MD5UpdateManager:
                     logger.info(f"  {old_md5} -> {new_md5}")
                 else:
                     logger.error(f"Failed to update: {binary_path}")
+
+            # Before the new MD5 is live, so running processes are never blocked
+            if self.transition_rules:
+                self.keep_old_md5_for_running(rule_file, original, changes)
 
             # Save updated rule file
             if self.save_rule_file(rule_file, rule_data):
@@ -524,6 +609,25 @@ class MD5UpdateManager:
 
         logger.info("=" * 70)
         return updated_count
+
+    def keep_old_md5_for_running(self, rule_file: Path, original: dict, changes):
+        """Add a transition rule with the old MD5s if an old binary still runs."""
+        for binary_path, (old_md5, _new_md5) in changes.items():
+            if not isinstance(old_md5, str) or not old_md5:
+                continue
+            if not running_old_image(binary_path):
+                continue
+            name = f"{rule_file.stem}{TRANSITION_MARKER}{old_md5[:8]}"
+            path = rule_file.with_name(f"{name}.json")
+            if self.save_rule_file(path, transition_rule(original, name)):
+                logger.info(
+                    f"Kept old MD5 for running {binary_path} until reboot "
+                    f"(transition rule: {path.name})"
+                )
+            else:
+                logger.warning(
+                    f"Running {binary_path} may be blocked until it restarts"
+                )
 
     def run(self) -> int:
         """Run the full update workflow."""
@@ -592,7 +696,7 @@ Examples:
     logger.info(f"OpenSnitch MD5 Update Hook Started (mode: {mode})", extra=FILE_ONLY)
 
     try:
-        exemptions = load_exemptions()
+        config = load_config()
     except ConfigError as e:
         logger.error(f"{e}; no rules were changed")
         return 1
@@ -603,7 +707,10 @@ Examples:
         logger.info(f"Changed files received: {len(changed_paths)}", extra=FILE_ONLY)
 
     manager = MD5UpdateManager(
-        auto_apply=args.auto, changed_paths=changed_paths, exemptions=exemptions
+        auto_apply=args.auto,
+        changed_paths=changed_paths,
+        exemptions=config.exemptions,
+        transition_rules=config.transition_rules,
     )
     return manager.run()
 

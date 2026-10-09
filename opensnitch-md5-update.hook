@@ -10,4 +10,3 @@ Description = Updating OpenSnitch rules with new binary MD5 hashes
 When = PostTransaction
 Exec = /usr/local/bin/opensnitch-md5-update.py --auto --stdin-targets
 NeedsTargets
-AbortOnFail = false

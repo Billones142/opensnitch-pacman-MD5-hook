@@ -89,6 +89,7 @@ class MD5UpdateManagerTest(unittest.TestCase):
         self,
         changed_paths: set[str] | None = None,
         exemptions: "md5_update.Exemptions | None" = None,
+        transition_rules: bool = True,
     ) -> int:
         manager = md5_update.MD5UpdateManager(
             auto_apply=True,
@@ -96,6 +97,7 @@ class MD5UpdateManagerTest(unittest.TestCase):
             backup_dir=self.backup_dir,
             changed_paths=changed_paths,
             exemptions=exemptions,
+            transition_rules=transition_rules,
         )
         return manager.run()
 
@@ -168,6 +170,7 @@ class MD5UpdateManagerTest(unittest.TestCase):
         self.run_manager()
 
         self.assertEqual(rule_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.rule_md5(rule_path), ELF_MD5)
 
     def test_binary_in_changed_paths_is_updated(self):
         rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
@@ -258,8 +261,81 @@ class MD5UpdateManagerTest(unittest.TestCase):
         owner.assert_not_called()
         self.assertEqual(self.rule_md5(rule_path), ELF_MD5)
 
+    def test_transition_rule_keeps_old_md5_for_running_binary(self):
+        rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
 
-class LoadExemptionsTest(unittest.TestCase):
+        with mock.patch.object(md5_update, "running_old_image", return_value=True):
+            self.run_manager()
+
+        self.assertEqual(self.rule_md5(rule_path), ELF_MD5)
+        transition_path = self.rules_dir / "r-md5-transition-00000000.json"
+        transition = json.loads(transition_path.read_text())
+        self.assertEqual(transition["name"], "r-md5-transition-00000000")
+        self.assertEqual(transition["duration"], "until restart")
+        self.assertEqual(transition["action"], "allow")
+        self.assertEqual(transition["operator"]["list"][1]["data"], OLD_MD5)
+        self.assertEqual(json.loads(transition["operator"]["data"])[1]["data"], OLD_MD5)
+        self.assertEqual(transition_path.stat().st_mode & 0o777, 0o600)
+        self.assertIn("until reboot", self.stdout.getvalue())
+
+    def test_no_transition_rule_when_old_binary_not_running(self):
+        self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
+
+        with mock.patch.object(md5_update, "running_old_image", return_value=False):
+            self.run_manager()
+
+        self.assertEqual([p.name for p in self.rules_dir.glob("*.json")], ["r.json"])
+
+    def test_transition_rules_can_be_disabled(self):
+        rule_path = self.write_rule("r.json", make_rule(str(self.binary), OLD_MD5))
+
+        with mock.patch.object(md5_update, "running_old_image", return_value=True):
+            self.run_manager(transition_rules=False)
+
+        self.assertEqual(self.rule_md5(rule_path), ELF_MD5)
+        self.assertEqual([p.name for p in self.rules_dir.glob("*.json")], ["r.json"])
+
+    def test_transition_rules_keep_their_old_md5(self):
+        transition_path = self.write_rule(
+            "r-md5-transition-00000000.json", make_rule(str(self.binary), OLD_MD5)
+        )
+
+        self.run_manager()
+
+        self.assertEqual(self.rule_md5(transition_path), OLD_MD5)
+
+
+class RunningOldImageTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.proc = Path(self.tmp.name) / "proc"
+        self.binary = Path(self.tmp.name) / "tool"
+        self.binary.touch()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def add_process(self, pid: str, exe_target: str | None):
+        process = self.proc / pid
+        process.mkdir(parents=True)
+        if exe_target is not None:
+            (process / "exe").symlink_to(exe_target)
+
+    def test_detects_deleted_image(self):
+        self.add_process("1", None)  # e.g. a kernel thread without exe
+        self.add_process("2", "/usr/bin/other (deleted)")
+        self.add_process("3", f"{os.path.realpath(self.binary)} (deleted)")
+
+        self.assertTrue(md5_update.running_old_image(str(self.binary), self.proc))
+
+    def test_current_image_does_not_count(self):
+        self.add_process("1", os.path.realpath(self.binary))
+        self.add_process("self", f"{os.path.realpath(self.binary)} (deleted)")
+
+        self.assertFalse(md5_update.running_old_image(str(self.binary), self.proc))
+
+
+class LoadConfigTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.config = Path(self.tmp.name) / "config.toml"
@@ -267,40 +343,44 @@ class LoadExemptionsTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_missing_file_means_no_exemptions(self):
-        self.assertEqual(
-            md5_update.load_exemptions(self.config), md5_update.Exemptions()
-        )
+    def test_missing_file_means_defaults(self):
+        config = md5_update.load_config(self.config)
+
+        self.assertEqual(config.exemptions, md5_update.Exemptions())
+        self.assertTrue(config.transition_rules)
 
     def test_valid_config(self):
         self.config.write_text(
-            'exempt_packages = ["a", "b-*"]\nexempt_foreign = true\n'
+            'exempt_packages = ["a", "b-*"]\n'
+            "exempt_foreign = true\n"
+            "transition_rules = false\n"
         )
 
-        exemptions = md5_update.load_exemptions(self.config)
+        config = md5_update.load_config(self.config)
 
-        self.assertEqual(exemptions.packages, ["a", "b-*"])
-        self.assertTrue(exemptions.foreign)
+        self.assertEqual(config.exemptions.packages, ["a", "b-*"])
+        self.assertTrue(config.exemptions.foreign)
+        self.assertFalse(config.transition_rules)
 
-    def test_shipped_config_has_no_exemptions(self):
-        self.assertEqual(
-            md5_update.load_exemptions(SHIPPED_CONFIG), md5_update.Exemptions()
-        )
+    def test_shipped_config_uses_defaults(self):
+        self.assertEqual(md5_update.load_config(SHIPPED_CONFIG), md5_update.Config())
 
     def test_shipped_config_examples_are_valid(self):
         lines = SHIPPED_CONFIG.read_text().splitlines()
-        # Uncomment the multi-line exempt_packages example and exempt_foreign
+        # Uncomment the multi-line exempt_packages example and the booleans
         start = lines.index("# exempt_packages = [")
         end = lines.index("# ]", start)
         example = [line[2:] for line in lines[start : end + 1]]
-        example.append("exempt_foreign = true")
+        for setting in ("exempt_foreign = true", "transition_rules = false"):
+            self.assertIn(f"# {setting}", lines)
+            example.append(setting)
         self.config.write_text("\n".join(example))
 
-        exemptions = md5_update.load_exemptions(self.config)
+        config = md5_update.load_config(self.config)
 
-        self.assertIn("python-*", exemptions.packages)
-        self.assertTrue(exemptions.foreign)
-        self.assertIn("# exempt_foreign = true", lines)
+        self.assertIn("python-*", config.exemptions.packages)
+        self.assertTrue(config.exemptions.foreign)
+        self.assertFalse(config.transition_rules)
 
     def test_invalid_configs_raise(self):
         for content in (
@@ -308,12 +388,13 @@ class LoadExemptionsTest(unittest.TestCase):
             'exempt_packages = "firefox"',
             "exempt_packages = [1]",
             'exempt_foreign = "yes"',
+            "transition_rules = 0",
             "exempt_package = []",
         ):
             with self.subTest(content=content):
                 self.config.write_text(content)
                 with self.assertRaises(md5_update.ConfigError):
-                    md5_update.load_exemptions(self.config)
+                    md5_update.load_config(self.config)
 
 
 class ColorTest(unittest.TestCase):

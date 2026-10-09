@@ -2,7 +2,8 @@
 # Configuration for the OpenSnitch MD5 pacman hook (opensnitch-md5-update.py).
 #
 # Every setting below is commented out, so by default no package is exempt and
-# every outdated MD5 is updated automatically after a pacman transaction.
+# every outdated MD5 is updated automatically after a pacman transaction, with
+# transition rules for programs still running the old binary.
 # Uncomment and edit the examples you need. `make install` never overwrites
 # this file once it exists.
 #
@@ -40,3 +41,15 @@
 # Default: false.
 #
 # exempt_foreign = true
+
+
+# --- transition_rules --------------------------------------------------------
+# opensnitchd hashes the image a process is running, so a program started
+# before an upgrade keeps the old MD5 until it restarts. When a rule's MD5 is
+# updated while the old binary still runs, the hook adds a temporary copy of
+# the rule with the old MD5 (<rule>-md5-transition-<md5>.json, duration
+# "until restart"), deleted at boot by /etc/tmpfiles.d/opensnitch-md5-update.conf.
+# Set to false to skip them: running programs then get prompted or blocked
+# until you restart them. Default: true.
+#
+# transition_rules = false
