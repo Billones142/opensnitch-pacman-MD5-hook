@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-SCRIPT = Path(__file__).resolve().parent.parent / "opensnitch-md5-update.py"
+SCRIPT = Path(__file__).resolve().parent.parent / "hook" / "opensnitch-md5-update.py"
 spec = importlib.util.spec_from_file_location("md5_update", SCRIPT)
 md5_update = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(md5_update)

@@ -4,6 +4,8 @@ HOOKDIR ?= /etc/pacman.d/hooks
 TMPFILESDIR ?= /etc/tmpfiles.d
 DESTDIR ?=
 
+# Installed files live in hook/; tools/ holds standalone helpers that aren't installed
+SRC    := hook
 SCRIPT := opensnitch-md5-update.py
 PIN    := opensnitch-md5-pin.py
 HOOK   := opensnitch-md5-update.hook
@@ -13,7 +15,7 @@ TMPFILES := opensnitch-md5-update.tmpfiles
 CONFIG_PATH := /etc/$(CONFIG)
 
 # Only the project's own sources (a local opensnitch checkout may sit next to them)
-PY_SOURCES := $(wildcard *.py) tests
+PY_SOURCES := hook tools tests
 
 .PHONY: help install uninstall test lint
 
@@ -27,20 +29,20 @@ help:
 	@echo "Variables: PREFIX=$(PREFIX) BINDIR=$(BINDIR) HOOKDIR=$(HOOKDIR) TMPFILESDIR=$(TMPFILESDIR) DESTDIR=$(DESTDIR)"
 
 install:
-	install -Dm755 $(SCRIPT) $(DESTDIR)$(BINDIR)/$(SCRIPT)
-	install -Dm755 $(PIN) $(DESTDIR)$(BINDIR)/$(PIN)
+	install -Dm755 $(SRC)/$(SCRIPT) $(DESTDIR)$(BINDIR)/$(SCRIPT)
+	install -Dm755 $(SRC)/$(PIN) $(DESTDIR)$(BINDIR)/$(PIN)
 	install -dm755 $(DESTDIR)$(HOOKDIR)
 	# Point the hook's Exec line at the actual install location
-	sed 's|^Exec = .*/$(SCRIPT)|Exec = $(BINDIR)/$(SCRIPT)|' $(HOOK) > $(DESTDIR)$(HOOKDIR)/$(HOOK)
+	sed 's|^Exec = .*/$(SCRIPT)|Exec = $(BINDIR)/$(SCRIPT)|' $(SRC)/$(HOOK) > $(DESTDIR)$(HOOKDIR)/$(HOOK)
 	chmod 644 $(DESTDIR)$(HOOKDIR)/$(HOOK)
 	# Deletes the "until reboot" transition rules at boot
-	install -Dm644 $(TMPFILES) $(DESTDIR)$(TMPFILESDIR)/opensnitch-md5-update.conf
+	install -Dm644 $(SRC)/$(TMPFILES) $(DESTDIR)$(TMPFILESDIR)/opensnitch-md5-update.conf
 	# Never overwrite an existing config, it holds the user's exemptions
 	@if test -e $(DESTDIR)$(CONFIG_PATH); then \
 		echo "Keeping existing $(DESTDIR)$(CONFIG_PATH)"; \
 	else \
-		echo "install -Dm644 $(CONFIG) $(DESTDIR)$(CONFIG_PATH)"; \
-		install -Dm644 $(CONFIG) $(DESTDIR)$(CONFIG_PATH); \
+		echo "install -Dm644 $(SRC)/$(CONFIG) $(DESTDIR)$(CONFIG_PATH)"; \
+		install -Dm644 $(SRC)/$(CONFIG) $(DESTDIR)$(CONFIG_PATH); \
 	fi
 
 # The config (/etc/opensnitch-md5-update.toml), logs (/var/log/opensnitch-md5-update.log)

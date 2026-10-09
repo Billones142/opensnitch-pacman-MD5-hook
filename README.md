@@ -52,6 +52,14 @@ Restarting the program (or rebooting) is enough to move it to the new binary; th
 - Python 3.11+ (standard library only, uses `tomllib`)
 - OpenSnitch with rules stored as JSON files
 
+## Repository layout
+
+| Directory | Contents                                                                                                 |
+| --------- | -------------------------------------------------------------------------------------------------------- |
+| `hook/`   | Everything `make install` installs: the hook, its scripts, the default config and the tmpfiles.d snippet |
+| `tools/`  | Standalone helpers, run from the checkout and never installed ([tools](#tools))                          |
+| `tests/`  | Unit tests for `hook/`                                                                                   |
+
 ## Install / uninstall
 
 Root is needed because the files are installed outside your home directory (`/usr/local/bin`, `/etc/pacman.d/hooks`, `/etc/tmpfiles.d` and `/etc`):
@@ -63,13 +71,13 @@ sudo make uninstall
 
 This installs:
 
-| File                             | Destination                                                      |
-| -------------------------------- | ---------------------------------------------------------------- |
-| `opensnitch-md5-update.py`       | `/usr/local/bin/opensnitch-md5-update.py`                        |
-| `opensnitch-md5-pin.py`          | `/usr/local/bin/opensnitch-md5-pin.py`                           |
-| `opensnitch-md5-update.hook`     | `/etc/pacman.d/hooks/opensnitch-md5-update.hook`                 |
-| `opensnitch-md5-update.tmpfiles` | `/etc/tmpfiles.d/opensnitch-md5-update.conf`                     |
-| `opensnitch-md5-update.toml`     | `/etc/opensnitch-md5-update.toml` (only if it doesn't exist yet) |
+| File                                  | Destination                                                      |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| `hook/opensnitch-md5-update.py`       | `/usr/local/bin/opensnitch-md5-update.py`                        |
+| `hook/opensnitch-md5-pin.py`          | `/usr/local/bin/opensnitch-md5-pin.py`                           |
+| `hook/opensnitch-md5-update.hook`     | `/etc/pacman.d/hooks/opensnitch-md5-update.hook`                 |
+| `hook/opensnitch-md5-update.tmpfiles` | `/etc/tmpfiles.d/opensnitch-md5-update.conf`                     |
+| `hook/opensnitch-md5-update.toml`     | `/etc/opensnitch-md5-update.toml` (only if it doesn't exist yet) |
 
 `PREFIX`, `BINDIR`, `HOOKDIR`, `TMPFILESDIR` and `DESTDIR` can be overridden (e.g. `sudo make install PREFIX=/usr`); the hook's `Exec` line is rewritten to match `BINDIR`.
 
@@ -173,11 +181,50 @@ Before a rule file is modified, a copy is saved as `/var/backups/opensnitch-rule
 sudo cp -p /var/backups/opensnitch-rules/<rule>.json_<timestamp>.bak /etc/opensnitchd/rules/<rule>.json
 ```
 
+## Tools
+
+`tools/` has two helpers for pinning many existing rules at once, e.g. right after enabling checksums. They aren't part of the hook and aren't installed: run them from the checkout. They reuse the code in `hook/`, so they have to stay next to it. Root is needed to read and write the rule files (`0600 root`).
+
+### Analyzing the rules
+
+`tools/analyze-md5-rules.py` is read-only. It sorts every `process.path` condition of every rule into a category:
+
+| Category          | Meaning                                                                                              |
+| ----------------- | ---------------------------------------------------------------------------------------------------- |
+| `PINNED-OK`       | Has an MD5 that matches the binary on disk                                                           |
+| `PINNED-OUTDATED` | Has an MD5 that no longer matches (the hook fixes these when pacman updates the binary)              |
+| `PINNED-UNUSABLE` | Has an MD5 the hook can't use: no single path next to it, missing binary or not an ELF file          |
+| `CANDIDATE`       | Exact path to an existing ELF binary without an MD5: it can be pinned                                |
+| `NOT-APPLICABLE`  | Regexp path, script, interpreter (its MD5 says nothing about the script it runs), missing or invalid |
+
+```sh
+sudo tools/analyze-md5-rules.py                      # colored report grouped by category
+sudo tools/analyze-md5-rules.py --json               # JSON on stdout
+sudo tools/analyze-md5-rules.py -o rules-report.json # JSON to a file, only the summary on screen
+```
+
+A progress bar is drawn on stderr while it runs, only on a terminal. With `-o` under `sudo`, the report file is handed back to your user.
+
+### Pinning from a report
+
+`tools/pin-from-report.py` pins the current MD5 into every `CANDIDATE` rule of a report, using the same code as `opensnitch-md5-pin.py` (backup first, then an atomic write).
+
+```sh
+tools/pin-from-report.py -n rules-report.json                   # preview only
+sudo tools/pin-from-report.py --packaged-only rules-report.json # recommended
+sudo tools/pin-from-report.py rules-report.json                 # all candidates
+```
+
+- It only pins a binary whose MD5 still matches the report; otherwise it asks you to re-run the analysis.
+- It only writes to the configured rules directory and ignores `rules_dir` from the JSON, since the report is a user-writable file and this runs as root.
+- It shows the plan and asks for confirmation unless `-y` is given. `--include-outdated` also refreshes `PINNED-OUTDATED` rules; transition rules are always skipped.
+- Binaries not owned by any pacman package (e.g. Steam/Proton under your home) are listed with a warning: the hook never refreshes them, so their rules stop matching after their next self-update. `--packaged-only` skips them.
+
 ## Development
 
 ```sh
 make test   # unit tests (stdlib unittest, no root needed)
-make lint   # ruff check + ruff format --check on the project's Python files
+make lint   # ruff check + ruff format --check on hook/, tools/ and tests/
 ```
 
 Tests never touch the real rules: they use temp dirs and mock the `pacman` queries. For a manual end-to-end run, point the scripts at temp files with the [environment variables](#environment-variables).

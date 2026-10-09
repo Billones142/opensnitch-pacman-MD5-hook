@@ -8,7 +8,7 @@ from pathlib import Path
 
 from test_md5_update import ELF_CONTENT, ELF_MD5, OLD_MD5, make_rule
 
-SCRIPT = Path(__file__).resolve().parent.parent / "opensnitch-md5-pin.py"
+SCRIPT = Path(__file__).resolve().parent.parent / "hook" / "opensnitch-md5-pin.py"
 spec = importlib.util.spec_from_file_location("md5_pin", SCRIPT)
 md5_pin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(md5_pin)
